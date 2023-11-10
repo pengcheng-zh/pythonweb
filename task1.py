@@ -210,7 +210,6 @@ def train_model(model, optimizer, criterion,
         print("Mode\tLoss\tAcc")
         print(f"Train\t{metrics['train_loss']:.2f}\t{metrics['train_acc']:.2f}")
         print(f"Valid\t{metrics['valid_loss']:.2f}\t{metrics['valid_acc']:.2f}")
-    return model, metrics
 
 
 def read_data(dataset):

@@ -8,7 +8,12 @@ import torch.nn as nn
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
+import conlleval
 import itertools
+
+from tqdm import tqdm
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class NERDataset(Dataset):
@@ -148,7 +153,6 @@ def train_model(model, optimizer, criterion,
                 test_loader,
                 num_epochs=30,
                 lr_scheduler=None):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device_model = model.to(device)
     for epoch in range(num_epochs):
         metrics = {
@@ -210,6 +214,7 @@ def train_model(model, optimizer, criterion,
         print("Mode\tLoss\tAcc")
         print(f"Train\t{metrics['train_loss']:.2f}\t{metrics['train_acc']:.2f}")
         print(f"Valid\t{metrics['valid_loss']:.2f}\t{metrics['valid_acc']:.2f}")
+    return model
 
 
 def read_data(dataset):
@@ -244,7 +249,6 @@ def read_data(dataset):
         else:
             unknown_count += count
 
-    word2idx = {word: idx for idx, word in enumerate(vocab)}
     tag_weight = compute_class_weight(
         class_weight='balanced',
         classes=np.array(list(tag2idx.keys())),
@@ -252,7 +256,7 @@ def read_data(dataset):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tag_weight = torch.Tensor(tag_weight).to(device)
     num_tags = len(tag2idx)
-    return vocab, word2idx, tag2idx, tag_weight, num_tags
+    return vocab, tag2idx, tag_weight, num_tags, idx_to_tag
 
 
 train_data, test_data, val_data = datasets.load_dataset("conll2003", split=('train', 'test', 'validation'))
@@ -260,17 +264,17 @@ train_data, test_data, val_data = datasets.load_dataset("conll2003", split=('tra
 to_remove = ['id', 'pos_tags', 'chunk_tags']
 
 train_data = train_data.remove_columns(to_remove)
-train_vocab, train_word2idx, train_tag2idx, train_tag_weight, train_num_tags = read_data(train_data)
+train_vocab, train_tag2idx, train_tag_weight, train_num_tags, idx2tag = read_data(train_data)
 
 val_data = val_data.remove_columns(to_remove)
-val_vocab, val_word2idx, val_tag2idx, val_tag_weight, val_num_tags = read_data(val_data)
+val_vocab, val_tag2idx, val_tag_weight, val_num_tags, _ = read_data(val_data)
 
 test_data = test_data.remove_columns(to_remove)
-test_vocab, test_word2idx, test_tag2idx, test_tag_weight, test_num_tags = read_data(test_data)
+test_vocab, test_tag2idx, test_tag_weight, test_num_tags, _ = read_data(test_data)
 
 train_dataset = NERDataset(train_data, train_vocab, train_tag2idx)
-val_dataset = NERDataset(val_data, val_vocab, val_tag2idx)
-test_dataset = NERDataset(test_data, test_vocab, test_tag2idx)
+val_dataset = NERDataset(val_data, train_vocab, train_tag2idx)
+test_dataset = NERDataset(test_data, train_vocab, train_tag2idx)
 
 seed = 42
 batch_size = 128
@@ -303,7 +307,7 @@ model = BiLSTM(len(train_vocab), train_num_tags, embedding_dim=100)
 criterion = nn.CrossEntropyLoss(weight=train_tag_weight, ignore_index=-1)
 optim = torch.optim.SGD(model.parameters(), lr=1.5, momentum=0.1)
 
-train_model(
+model = train_model(
     model=model,
     optimizer=optim,
     criterion=criterion,
@@ -312,3 +316,39 @@ train_model(
     num_epochs=20,
 )
 
+
+def model_test(model, test_dataset, idx2tag):
+    sampler = SequentialSampler(test_data)
+    test_dataloader = DataLoader(test_dataset, batch_size=128, shuffle=False, collate_fn=collate_fn,
+                                 sampler=sampler)
+    model = model.to(device)
+
+    tag_true = []
+    tag_preds = []
+    for i, ((X, case_bool, lengths), y) in enumerate(tqdm(test_dataloader)):
+        model.eval()
+
+        # Move to GPU
+        X = X.to(device)
+        y = y.to(device)
+        case_bool = case_bool.to(device)
+
+        output = model(X, case_bool, lengths)
+        output = torch.argmax(output, axis=2)
+
+        for j in range(len(output)):
+            tags_a = []
+            tags_b = []
+            for k in range(int(lengths[j])):
+                tags_a.append(idx2tag[int(y[j][k])])
+                tags_b.append(idx2tag[int(output[j][k])])
+            tag_true.append(tags_a)
+            tag_preds.append(tags_b)
+
+    precision, recall, f1 = conlleval.evaluate(itertools.chain(*tag_true), itertools.chain(*tag_preds))
+
+    print(f"Precision\tRecall\tF1_score")
+    print(f"{precision:.2f}\t{recall:.2f}\t{f1:.2f}")
+
+
+model_test(model, test_dataset, idx2tag)
